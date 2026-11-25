@@ -1,15 +1,14 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
-    io::BufReader,
     ops::{Add, AddAssign, Sub, SubAssign},
     path::PathBuf,
 };
 
 use clap::Parser;
-use csv::{ReaderBuilder, Trim};
+use csv::{ReaderBuilder, Trim, WriterBuilder};
 use rust_decimal::Decimal;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, thiserror::Error)]
 enum Error {
@@ -153,6 +152,25 @@ impl TransactionKind {
         }
     }
 }
+#[derive(Serialize)]
+struct AccountRecord {
+    client: u16,
+    available: Decimal,
+    held: Decimal,
+    total: Decimal,
+    locked: bool,
+}
+impl AccountRecord {
+    fn new(client_id: ClientId, account: Account) -> Self {
+        Self {
+            client: client_id.0,
+            available: account.available.0,
+            held: account.held.0,
+            total: account.available.0 + account.held.0,
+            locked: account.is_frozen,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 struct Account {
@@ -194,6 +212,14 @@ impl AccountsMap {
             .expect("must exist because the array covers the whole id range")
             .get_or_insert(Account::default())
     }
+    fn into_iter(self) -> impl Iterator<Item = (ClientId, Account)> {
+        self.0
+            .into_iter()
+            .enumerate()
+            .filter_map(|(id, maybe_account)| {
+                maybe_account.map(|account| (ClientId(id as u16), account))
+            })
+    }
 }
 
 /// Account Balance Engine: read transactions from CSV and calculate account balances
@@ -204,6 +230,9 @@ struct Cli {
     input: PathBuf,
 }
 
+/// 256KB buffer
+const BUFFER_SIZE: usize = 256 * 1024;
+
 fn main() -> Result<(), Error> {
     let cli = Cli::parse();
 
@@ -212,14 +241,13 @@ fn main() -> Result<(), Error> {
     //
     // this could be replaced with any Read type, like tcp streams or stdin
     let file = File::open(&cli.input).map_err(Error::Io)?;
-    // 256KB buffer
-    let buf_reader = BufReader::with_capacity(256 * 1024, file);
     let tx_records = ReaderBuilder::new()
         .has_headers(true)
         .delimiter(b',')
         .trim(Trim::All)
         .flexible(true)
-        .from_reader(buf_reader)
+        .buffer_capacity(BUFFER_SIZE)
+        .from_reader(file)
         .into_deserialize::<TransactionRecord>();
 
     // used to enforce that transactions are globally unique
@@ -321,6 +349,26 @@ fn main() -> Result<(), Error> {
             }
         }
     }
+
+    let stdout = std::io::stdout().lock();
+    write_output(accounts, stdout)?;
+
+    Ok(())
+}
+
+fn write_output<W: std::io::Write>(accounts: AccountsMap, writer: W) -> Result<(), Error> {
+    let mut csv_writer = WriterBuilder::new()
+        .has_headers(true)
+        .delimiter(b',')
+        .buffer_capacity(BUFFER_SIZE)
+        .from_writer(writer);
+
+    for (client_id, account) in accounts.into_iter() {
+        let record = AccountRecord::new(client_id, account);
+        csv_writer.serialize(record).map_err(Error::Csv)?;
+    }
+
+    csv_writer.flush().map_err(Error::Io)?;
 
     Ok(())
 }
